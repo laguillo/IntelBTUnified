@@ -1,0 +1,14 @@
+# idProduct  generation  nombre            (vendor siempre 0x8087)
+0x0025  gen2  9260/9560-JfP
+0x0026  gen2  AX201
+0x0029  gen2  AX200
+0x0032  gen3  AX210
+0x0033  gen3  AX211
+0x0035  gen3  Gale-Peak
+0x0036  gen3  Gale-Peak-2
+0x0038  gen3  BE200-Misty-Peak
+0x07dc  gen1  7260-7265
+0x0a2a  gen1  3165
+0x0a2b  gen2  8265
+0x0aa7  gen1  3168
+0x0aaa  gen2  9460-9560
