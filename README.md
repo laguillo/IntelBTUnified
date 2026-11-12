@@ -45,6 +45,7 @@ An ID that is not in the table is rejected instead of being silently treated as 
 | `-btlfxboardid` | Patches the board-id in `BlueTool`/`bluetoothd` (macOS 14+). |
 | `-btlfxallowanyaddr` | Skips the "same address as the internal module" check (macOS 12.4+). |
 | `-btlfxnvramcheck` | Skips the internal-controller NVRAM check (macOS 14 or earlier). |
+| `-ibtnoevict` | Does not evict patched pages before a pagein (see below). Only for diagnosis: brings back the `bluetoothd` crash loop. |
 
 ### Reading the kernel logs
 
@@ -74,6 +75,11 @@ Run `make clean` when you change `FW`. To pick another firmware, `FW` takes spac
   validated (underflow in `wLength - 3`); atomic state; no descriptor leak; macOS ≤ 11 support removed.
 - **`bluetoothd`/`BlueTool` patches (BlueToolFixup):** the same ones, and each logs a line the first time it is applied, so a pattern that
   stops matching after a macOS update shows up instead of failing silently.
+- **`bluetoothd` crash loop (Bluetooth turning itself on and off):** the patches are written into the file's page cache, and
+  `bluetoothd`/`BlueTool` are compressed on the sealed system volume in 64 KB chunks whose hash APFS checks on every pagein. With a
+  patched page still resident and a neighbour in the same chunk evicted, the pagein fails (`compressed data hash mismatch`),
+  `bluetoothd` dies with `SIGBUS` and launchd restarts it over and over. Upstream BlueToolFixup has the same problem. The kext now
+  hooks `vnode_pagein` and evicts the patched pages of the chunk first; they are re-read and re-patched when next used.
 - **Firmware driver:** a leaked `IOMemoryDescriptor` on every successful bulk write; `start()` error paths (PMstop, closing the device,
   the wrong `stop(this)` call); a leaked reference on `fw_name`; chip generation now taken from `devices.txt`; the uncompressed firmware size is
   stored when packaging instead of assuming 4×; its own `_start`/`_stop` removed, which overrode the ones from `libkmod`.

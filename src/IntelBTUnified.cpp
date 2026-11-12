@@ -21,6 +21,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <sys/random.h>
+#include <sys/ubc.h>
 
 #include "Devices.h"
 
@@ -260,19 +261,129 @@ static inline void notePatch(PatchId id, const char *name, const char *path) {
         SYSLOG(MODULE_BTLFX, "patched %s: %s", path, name);
 }
 
-static inline void searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
-    if (KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize))
-        notePatch(id, name, path);
+static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *patch, size_t replaceSize) {
+    if (!KernelPatcher::findAndReplace(const_cast<void *>(haystack), haystackSize, needle, findSize, patch, replaceSize))
+        return false;
+    notePatch(id, name, path);
+    return true;
 }
 
 template <size_t findSize, size_t replaceSize>
-static inline void searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const uint8_t (&needle)[findSize], const uint8_t (&patch)[replaceSize]) {
-    searchAndPatch(id, name, haystack, haystackSize, path, needle, findSize, patch, replaceSize);
+static inline bool searchAndPatch(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const uint8_t (&needle)[findSize], const uint8_t (&patch)[replaceSize]) {
+    return searchAndPatch(id, name, haystack, haystackSize, path, needle, findSize, patch, replaceSize);
 }
 
-static inline void searchAndPatchWithMask(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize) {
-    if (KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, nullptr, 0))
-        notePatch(id, name, path);
+static inline bool searchAndPatchWithMask(PatchId id, const char *name, const void *haystack, size_t haystackSize, const char *path, const void *needle, size_t findSize, const void *findMask, size_t findMaskSize, const void *patch, size_t replaceSize) {
+    if (!KernelPatcher::findAndReplaceWithMask(const_cast<void *>(haystack), haystackSize, needle, findSize, findMask, findMaskSize, patch, replaceSize, nullptr, 0))
+        return false;
+    notePatch(id, name, path);
+    return true;
+}
+
+#pragma mark - Paginas parcheadas y bloques comprimidos de APFS
+
+// Los parches se escriben en la pagina de la cache del archivo (UBC), no en una copia privada del
+// proceso. BlueTool y bluetoothd estan comprimidos en el volumen de sistema sellado, en bloques de
+// 64 KB, y APFS verifica el hash de un bloque cuando carga cualquier pagina suya. Si la pagina
+// parcheada sigue en memoria y una vecina del mismo bloque fue desalojada, APFS ve un bloque que no
+// cuadra con el hash ("compressed data hash mismatch"): la carga falla, bluetoothd muere con SIGBUS
+// y launchd lo reinicia en bucle (el Bluetooth se enciende y apaga solo) hasta que la pagina
+// parcheada tambien sale de memoria. Visto en macOS 26.7.2 y 26.7.3; afecta igual a BlueToolFixup.
+//
+// Remedio: antes de cada pagein de esos binarios se desalojan las paginas parcheadas del mismo
+// bloque. APFS lee entonces el bloque original, y la pagina parcheada, cuando se vuelva a usar, se
+// carga de nuevo y pasa otra vez por cs_validate_page, que la vuelve a parchear.
+
+static constexpr off_t kCompressionChunk = 0x10000;
+static constexpr size_t kMaxPatchedPages = 32;
+
+struct PatchedPage {
+    vnode_t vp;
+    uint32_t vid;
+    off_t offset;
+};
+
+static PatchedPage patchedPages[kMaxPatchedPages];
+static size_t patchedPageCount = 0;
+static size_t patchedPageNext = 0;
+static IOSimpleLock *patchedPagesLock = nullptr;
+static bool evictionLogged = false;
+
+using t_ubc_msync = errno_t (*)(vnode_t, off_t, off_t, off_t *, int);
+using t_vnode_vid = uint32_t (*)(vnode_t);
+static t_ubc_msync ubcMsync = nullptr;
+static t_vnode_vid vnodeVid = nullptr;
+static mach_vm_address_t orig_vnode_pagein {};
+
+static void rememberPatchedPage(vnode_t vp, off_t offset) {
+    if (patchedPagesLock == nullptr)
+        return;
+    uint32_t vid = vnodeVid(vp);
+    IOSimpleLockLock(patchedPagesLock);
+    size_t count = __atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED);
+    size_t slot = count;
+    for (size_t i = 0; i < count; i++) {
+        if (patchedPages[i].vp == vp && patchedPages[i].offset == offset) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == count) {
+        if (count < kMaxPatchedPages) {
+            __atomic_store_n(&patchedPageCount, count + 1, __ATOMIC_RELEASE);
+        } else {
+            slot = patchedPageNext;
+            patchedPageNext = (patchedPageNext + 1) % kMaxPatchedPages;
+        }
+    }
+    patchedPages[slot].vid = vid;
+    patchedPages[slot].offset = offset;
+    __atomic_store_n(&patchedPages[slot].vp, vp, __ATOMIC_RELEASE);
+    IOSimpleLockUnlock(patchedPagesLock);
+}
+
+// Llamado al principio de cada vnode_pagein del sistema: tiene que ser barato cuando el vnode no es
+// uno de los parcheados (solo comparaciones de punteros, sin lock).
+static void evictPatchedNeighbours(vnode_t vp, off_t start, off_t size) {
+    size_t count = __atomic_load_n(&patchedPageCount, __ATOMIC_ACQUIRE);
+    bool known = false;
+    for (size_t i = 0; i < count && !known; i++)
+        known = __atomic_load_n(&patchedPages[i].vp, __ATOMIC_RELAXED) == vp;
+    if (!known)
+        return;
+
+    off_t end = start + size;
+    off_t chunkStart = start & ~(kCompressionChunk - 1);
+    off_t chunkEnd = (end + kCompressionChunk - 1) & ~(kCompressionChunk - 1);
+    uint32_t vid = vnodeVid(vp);
+    off_t victims[kMaxPatchedPages];
+    size_t victimCount = 0;
+
+    IOSimpleLockLock(patchedPagesLock);
+    for (size_t i = 0; i < patchedPageCount; i++) {
+        auto &page = patchedPages[i];
+        // Las paginas del propio rango estan ausentes (son las que se cargan) y alguna esta marcada
+        // como ocupada por este mismo fallo de pagina: no se tocan.
+        if (page.vp == vp && page.vid == vid && page.offset >= chunkStart && page.offset < chunkEnd &&
+            (page.offset < start || page.offset >= end))
+            victims[victimCount++] = page.offset;
+    }
+    IOSimpleLockUnlock(patchedPagesLock);
+
+    for (size_t i = 0; i < victimCount; i++) {
+        errno_t err = ubcMsync(vp, victims[i], victims[i] + PAGE_SIZE, nullptr, UBC_INVALIDATE);
+        if (!__atomic_exchange_n(&evictionLogged, true, __ATOMIC_RELAXED))
+            SYSLOG(MODULE_BTLFX, "evicting patched page 0x%llx before pagein 0x%llx+0x%llx (err %d); further evictions are not logged",
+                   (unsigned long long)victims[i], (unsigned long long)start, (unsigned long long)size, err);
+        DBGLOG(MODULE_BTLFX, "evicted patched page 0x%llx before pagein 0x%llx+0x%llx (err %d)",
+               (unsigned long long)victims[i], (unsigned long long)start, (unsigned long long)size, err);
+    }
+}
+
+static int patched_vnode_pagein(vnode_t vp, upl_t upl, upl_offset_t upl_offset, vm_object_offset_t f_offset, upl_size_t size, int flags, int *errorp) {
+    if (__atomic_load_n(&patchedPageCount, __ATOMIC_RELAXED) != 0)
+        evictPatchedNeighbours(vp, (off_t)f_offset, (off_t)size);
+    return FunctionCast(patched_vnode_pagein, orig_vnode_pagein)(vp, upl, upl_offset, f_offset, size, flags, errorp);
 }
 
 static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
@@ -281,25 +392,28 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
     FunctionCast(patched_cs_validate_page, orig_cs_validate)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
     static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
     if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
+        bool patched = false;
         if (strcmp(path + dirLength, "BlueTool") == 0) {
-            searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
+            patched |= searchAndPatch(PatchSkipUpdate, "skip firmware auto-update", data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
             if (shouldPatchBoardId)
-                searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                patched |= searchAndPatch(PatchBlueToolBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
         }
         else if (strcmp(path + dirLength, "bluetoothd") == 0) {
-            searchAndPatch(PatchVendor, "vendor check", data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
-            searchAndPatch(PatchChipset, "chipset range check", data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
+            patched |= searchAndPatch(PatchVendor, "vendor check", data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
+            patched |= searchAndPatch(PatchChipset, "chipset range check", data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
             if (getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia)
-                searchAndPatch(PatchChipset13, "chipset range check (13.3)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
+                patched |= searchAndPatch(PatchChipset13, "chipset range check (13.3)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
             if (getKernelVersion() >= KernelVersion::Sequoia)
-                searchAndPatch(PatchChipset15, "chipset range check (15.4)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
+                patched |= searchAndPatch(PatchChipset15, "chipset range check (15.4)", data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
             if (shouldPatchNvramCheck)
-                searchAndPatchWithMask(PatchNvram, "internal controller NVRAM check", data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3));
+                patched |= searchAndPatchWithMask(PatchNvram, "internal controller NVRAM check", data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3));
             if (shouldPatchBoardId)
-                searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+                patched |= searchAndPatch(PatchBtdBid, "board-id", data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (shouldPatchAddress)
-                searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
+                patched |= searchAndPatchWithMask(PatchAddress, "same-address check", data, PAGE_SIZE, path, kSkipAddressCheckOriginal, sizeof(kSkipAddressCheckOriginal), kSkipAddressCheckMask, sizeof(kSkipAddressCheckMask), kSkipAddressCheckPatched, sizeof(kSkipAddressCheckPatched));
         }
+        if (patched)
+            rememberPatchedPage(vp, (off_t)page_offset);
     }
 }
 
@@ -322,6 +436,31 @@ static void processPatcher(KernelPatcher &patcher) {
         shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
     if (getKernelVersion() <= KernelVersion::Sonoma)
         shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
+    // Antes que cs_validate_page: si esto falla no se registra ninguna pagina y todo sigue como antes.
+    if (checkKernelArgument("-ibtnoevict")) {
+        SYSLOG(MODULE_BTLFX, "-ibtnoevict: patched pages are not evicted before pagein");
+    } else {
+        ubcMsync = reinterpret_cast<t_ubc_msync>(patcher.solveSymbol(KernelPatcher::KernelID, "_ubc_msync"));
+        if (ubcMsync == nullptr)
+            patcher.clearError();
+        vnodeVid = reinterpret_cast<t_vnode_vid>(patcher.solveSymbol(KernelPatcher::KernelID, "_vnode_vid"));
+        if (vnodeVid == nullptr)
+            patcher.clearError();
+        if (ubcMsync != nullptr && vnodeVid != nullptr) {
+            patchedPagesLock = IOSimpleLockAlloc();
+            KernelPatcher::RouteRequest pageinRoute("_vnode_pagein", patched_vnode_pagein, orig_vnode_pagein);
+            if (patchedPagesLock == nullptr || !patcher.routeMultipleLong(KernelPatcher::KernelID, &pageinRoute, 1)) {
+                SYSLOG(MODULE_BTLFX, "failed to route vnode_pagein, patched pages will not be evicted");
+                patcher.clearError();
+                if (patchedPagesLock != nullptr) {
+                    IOSimpleLockFree(patchedPagesLock);
+                    patchedPagesLock = nullptr;
+                }
+            }
+        } else {
+            SYSLOG(MODULE_BTLFX, "failed to resolve ubc_msync/vnode_vid, patched pages will not be evicted");
+        }
+    }
     KernelPatcher::RouteRequest csRoute("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
     if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
         SYSLOG(MODULE_BTLFX, "failed to route cs validation pages");

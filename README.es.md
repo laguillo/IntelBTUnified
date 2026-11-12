@@ -45,6 +45,7 @@ Un ID que no esté en la tabla se rechaza en vez de tratarse como Gen2 en silenc
 | `-btlfxboardid` | Parchea el board‑id en `BlueTool`/`bluetoothd` (macOS 14+). |
 | `-btlfxallowanyaddr` | Salta el chequeo de «dirección igual a la del módulo interno» (macOS 12.4+). |
 | `-btlfxnvramcheck` | Salta el chequeo de NVRAM del controlador interno (macOS 14 o anterior). |
+| `-ibtnoevict` | No desaloja las páginas parcheadas antes de un pagein (ver abajo). Solo para diagnóstico: vuelve el bucle de crashes de `bluetoothd`. |
 
 ### Ver los logs del kernel
 
@@ -74,6 +75,12 @@ Haz `make clean` al cambiar `FW`. Para elegir otro firmware, `FW` acepta patrone
   las máquinas); se validan longitudes (underflow en `wLength - 3`); estado atómico; sin fuga del descriptor; eliminado el soporte de macOS ≤ 11.
 - **Parches de `bluetoothd`/`BlueTool` (BlueToolFixup):** los mismos, y cada uno deja una línea en el log la primera vez que se aplica,
   de modo que un patrón que deje de coincidir tras actualizar macOS se nota en lugar de fallar en silencio.
+- **Bucle de crashes de `bluetoothd` (el Bluetooth se enciende y apaga solo):** los parches se escriben en la caché de páginas del
+  archivo, y `bluetoothd`/`BlueTool` están comprimidos en el volumen de sistema sellado en bloques de 64 KB cuyo hash APFS comprueba
+  en cada pagein. Con una página parcheada en memoria y una vecina del mismo bloque desalojada, el pagein falla
+  (`compressed data hash mismatch`), `bluetoothd` muere con `SIGBUS` y launchd lo reinicia una y otra vez. El BlueToolFixup original
+  tiene el mismo problema. Ahora el kext engancha `vnode_pagein` y antes desaloja las páginas parcheadas del bloque; se vuelven a leer
+  y a parchear cuando se usan.
 - **Driver de firmware:** fuga de un `IOMemoryDescriptor` en cada escritura bulk correcta; caminos de error de `start()` (PMstop, cierre
   del dispositivo, `stop(this)` incorrecto); referencia perdida en `fw_name`; generación del chip según `devices.txt`; el tamaño del
   firmware descomprimido se guarda al empaquetar en vez de suponer 4×; se quita el `_start`/`_stop` propio, que pisaba los de `libkmod`.

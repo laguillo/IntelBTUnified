@@ -32,15 +32,16 @@ One bundle, three cooperating pieces:
 2. **IOKit firmware driver** — `src/driver/` (`IntelBluetoothFirmware` class, `BtIntel*`, `IntelBluetoothOpsGen1/2/3`, `USBDeviceController`). Matches the USB device, picks the generation from `devices.txt`, downloads the `.sfi`/`.ddc` firmware over bulk pipes. Only Gen3 (AX210/AX211/…) has been exercised on this machine.
 3. **Generated pieces** (all under `build/`, driven by `devices.txt`, the single source of truth for supported USB product IDs): `Devices.h` (driver and plugin tables), `Info.plist` personalities, and `FwBinary.cpp` (zlib-compressed firmware from `fw/`, with the uncompressed size stored).
 
-Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`.
+Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`; `-ibtnoevict` disables the pagein eviction (diagnosis only).
 
 ## Things that are easy to get wrong
 
 - Intel AX210 is USB `8087:0032` (AX201 is `0026`). The bundle id is `local.IntelBTUnified`; the Lilu plugin IOService class is named after `PRODUCT_NAME` (`IntelBTUnified`).
 - Never load this kext together with the three old ones; patches would apply twice. In OpenCore it must come after Lilu in `Kernel → Add`.
 - After a warm reboot the chip keeps its firmware, so the driver downloads nothing and `fw_name` may be `(already running)`; that is normal.
-- Kernel code cannot be exercised by building: it only runs after the kext is installed into the EFI and the machine reboots. Do not modify a mounted EFI (`/Volumes/EFI`) without being asked.
+- Kernel code cannot be exercised by building: it only runs after the kext is installed into the EFI and the machine reboots. Do not modify a mounted EFI (`/Volumes/NO NAME` on this machine) without being asked.
 - Kernel logs are not in the unified log. `sudo dmesg` is the only source, its 128 KB buffer is flooded by ItlIwx Wi-Fi scan lines, and `sudo` cannot prompt inside Claude Code (the user must run it in their own Terminal and dump to a file). Boot-arg `msgbuf=1048576` enlarges the buffer.
+- `cs_validate_page` patches modify the shared page-cache page of the file. `bluetoothd`/`BlueTool` are APFS-compressed (64 KB chunks, hash-verified on the sealed volume), so a resident patched page makes the pagein of any evicted neighbour in the same chunk fail → `bluetoothd` SIGBUS crash loop (crash reports show `compressed data hash mismatch` in `ktriageinfo`). The `vnode_pagein` hook evicts the chunk's patched pages (`ubc_msync` + `UBC_INVALIDATE`) before the pagein; do not remove it. Reproducible from user space without root: `msync(MS_INVALIDATE)` one neighbour page of the patched page in a read-only mmap of `/usr/sbin/bluetoothd`, then read it → `EFAULT`.
 - License is GPL-3.0-only (inherited); the firmware license is `licenses/iwlwifi-firmware.txt`.
 
 See `README.md` for install steps and the list of fixes made over the upstream code.
