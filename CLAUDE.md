@@ -32,7 +32,7 @@ One bundle, three cooperating pieces:
 2. **IOKit firmware driver** — `src/driver/` (`IntelBluetoothFirmware` class, `BtIntel*`, `IntelBluetoothOpsGen1/2/3`, `USBDeviceController`). Matches the USB device, picks the generation from `devices.txt`, downloads the `.sfi`/`.ddc` firmware over bulk pipes. Only Gen3 (AX210/AX211/…) has been exercised on this machine.
 3. **Generated pieces** (all under `build/`, driven by `devices.txt`, the single source of truth for supported USB product IDs): `Devices.h` (driver and plugin tables), `Info.plist` personalities, and `FwBinary.cpp` (zlib-compressed firmware from `fw/`, with the uncompressed size stored).
 
-Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`; `-ibtnoevict` disables the pagein eviction (diagnosis only).
+Boot-args: `-ibtoff` / `-ibtdbg` / `-ibtbeta` plus the legacy `-ibtcompat*` and `-btlfx*` spellings; feature flags `-btlfxboardid`, `-btlfxallowanyaddr`, `-btlfxnvramcheck`; `-ibtnoevict` disables the pagein eviction (diagnosis only); `-ibtupatchoff` / `-ibtubluetooloff` skip registering the IntelBTPatcher (`deviceRequest`) / BlueToolFixup (`processPatcher`) hooks, so the kext can sit next to ForbiddenItlwm's `BTLEAdvFixup`, which hooks the same `deviceRequest` (two Lilu routes of one function panic). The `-ibtu…` prefix is how they were contributed (PR #2); keep it, boot-args are a published interface.
 
 ## Things that are easy to get wrong
 

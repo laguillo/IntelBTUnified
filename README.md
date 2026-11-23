@@ -40,6 +40,8 @@ An ID that is not in the table is rejected instead of being silently treated as 
 | Argument | Effect |
 |---|---|
 | `-ibtoff` | Disables the plugin (patches). `-ibtcompatoff` and `-btlfxoff` also work. |
+| `-ibtupatchoff` | Disables only the IntelBTPatcher part (the HCI hook that sends the random BLE address). Needed with ForbiddenItlwm's `BTLEAdvFixup` (see below). |
+| `-ibtubluetooloff` | Disables only the BlueToolFixup part (the `BlueTool`/`bluetoothd` patches and the pagein eviction). Third-party Bluetooth does not work on macOS 12+ without those patches, so use it only for diagnosis or when another kext applies them. |
 | `-ibtdbg` | Debug logging (`-ibtcompatdbg`, `-btlfxdbg`). |
 | `-ibtbeta` | Allows macOS newer than the declared maximum (`-ibtcompatbeta`, `-btlfxbeta`). |
 | `-btlfxboardid` | Patches the board-id in `BlueTool`/`bluetoothd` (macOS 14+). |
@@ -47,11 +49,25 @@ An ID that is not in the table is rejected instead of being silently treated as 
 | `-btlfxnvramcheck` | Skips the internal-controller NVRAM check (macOS 14 or earlier). |
 | `-ibtnoevict` | Does not evict patched pages before a pagein (see below). Only for diagnosis: brings back the `bluetoothd` crash loop. |
 
+### With ForbiddenItlwm (AirDrop)
+
+[ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm)'s `BTLEAdvFixup.kext` hooks the same function as the IntelBTPatcher
+part (`IOUSBHostDevice::deviceRequest`), and Lilu panics if two plugins hook the same function. To use both:
+
+- Add `-ibtupatchoff`: `BTLEAdvFixup` takes over that part's job.
+- In `Kernel → Add`, put `IntelBTUnified.kext` before `BTLEAdvFixup.kext`. `BTLEAdvFixup` must load after the BlueToolFixup patches,
+  which this kext applies.
+
+This combination has not been tested here. Each kext then works around the APFS crash loop described below in its own way
+(this one evicts pages before a pagein, `BTLEAdvFixup` hooks `apfs_vnop_verify`). ForbiddenItlwm's own guide supports only
+`IntelBluetoothFirmware` + `BlueToolFixup` + `BTLEAdvFixup`.
+
 ### Reading the kernel logs
 
 The kext's messages do not show up in `log show`; only in `sudo dmesg`. The default buffer (128 KB) fills up quickly; add the
-boot-arg `msgbuf=1048576`. Look for `ibtp`, `btlfx` and `IntelFirmware`. You should see `ibtp: routed __ZN15IOUSBHostDevice13deviceRequest…`
-and `btlfx: patched /usr/sbin/bluetoothd: …` lines.
+boot-arg `msgbuf=1048576`. Look for `ibt`, `ibtp`, `btlfx` and `IntelFirmware`. The `start (IntelBTPatcher=1 BlueToolFixup=1)` line
+shows which parts are enabled. You should see `ibtp: routed __ZN15IOUSBHostDevice13deviceRequest…` (unless `-ibtupatchoff`)
+and `btlfx: patched /usr/sbin/bluetoothd: …` lines (unless `-ibtubluetooloff`).
 
 ## Building
 

@@ -40,6 +40,8 @@ Un ID que no esté en la tabla se rechaza en vez de tratarse como Gen2 en silenc
 | Argumento | Efecto |
 |---|---|
 | `-ibtoff` | Desactiva el plugin (parches). También valen `-ibtcompatoff` y `-btlfxoff`. |
+| `-ibtupatchoff` | Desactiva solo la parte IntelBTPatcher (el hook HCI que envía la dirección BLE aleatoria). Necesario con el `BTLEAdvFixup` de ForbiddenItlwm (ver abajo). |
+| `-ibtubluetooloff` | Desactiva solo la parte BlueToolFixup (los parches de `BlueTool`/`bluetoothd` y el desalojo antes del pagein). En macOS 12+ el Bluetooth de terceros no funciona sin esos parches: úsalo solo para diagnóstico o si otro kext los aplica. |
 | `-ibtdbg` | Log de depuración (`-ibtcompatdbg`, `-btlfxdbg`). |
 | `-ibtbeta` | Permite macOS más nuevo que el máximo declarado (`-ibtcompatbeta`, `-btlfxbeta`). |
 | `-btlfxboardid` | Parchea el board‑id en `BlueTool`/`bluetoothd` (macOS 14+). |
@@ -47,11 +49,25 @@ Un ID que no esté en la tabla se rechaza en vez de tratarse como Gen2 en silenc
 | `-btlfxnvramcheck` | Salta el chequeo de NVRAM del controlador interno (macOS 14 o anterior). |
 | `-ibtnoevict` | No desaloja las páginas parcheadas antes de un pagein (ver abajo). Solo para diagnóstico: vuelve el bucle de crashes de `bluetoothd`. |
 
+### Con ForbiddenItlwm (AirDrop)
+
+El `BTLEAdvFixup.kext` de [ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm) engancha la misma función que la parte
+IntelBTPatcher (`IOUSBHostDevice::deviceRequest`), y Lilu entra en pánico si dos plugins enganchan la misma función. Para usar los dos:
+
+- Añade `-ibtupatchoff`: `BTLEAdvFixup` se encarga de lo que hacía esa parte.
+- En `Kernel → Add`, pon `IntelBTUnified.kext` antes de `BTLEAdvFixup.kext`. `BTLEAdvFixup` tiene que cargarse después de los
+  parches de BlueToolFixup, que aplica este kext.
+
+Esta combinación no se ha probado aquí. Cada kext esquiva a su manera el bucle de crashes de APFS que se describe más abajo
+(este desaloja páginas antes del pagein, `BTLEAdvFixup` engancha `apfs_vnop_verify`). La guía de ForbiddenItlwm solo da soporte a
+`IntelBluetoothFirmware` + `BlueToolFixup` + `BTLEAdvFixup`.
+
 ### Ver los logs del kernel
 
 Los mensajes del kext no salen en `log show`; solo en `sudo dmesg`. El buffer por defecto (128 KB) se llena enseguida; añade el
-boot-arg `msgbuf=1048576`. Busca `ibtp`, `btlfx` e `IntelFirmware`. Deberías ver `ibtp: routed __ZN15IOUSBHostDevice13deviceRequest…`
-y líneas `btlfx: patched /usr/sbin/bluetoothd: …`.
+boot-arg `msgbuf=1048576`. Busca `ibt`, `ibtp`, `btlfx` e `IntelFirmware`. La línea `start (IntelBTPatcher=1 BlueToolFixup=1)`
+indica qué partes están activas. Deberías ver `ibtp: routed __ZN15IOUSBHostDevice13deviceRequest…` (salvo con `-ibtupatchoff`)
+y líneas `btlfx: patched /usr/sbin/bluetoothd: …` (salvo con `-ibtubluetooloff`).
 
 ## Compilar
 
