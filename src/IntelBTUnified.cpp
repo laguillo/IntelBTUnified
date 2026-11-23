@@ -467,17 +467,25 @@ static void processPatcher(KernelPatcher &patcher) {
 }
 
 #pragma mark - Lilu
-
+// Independent Lilu patch controls; the firmware IOKit driver is separate.
 static void pluginStart() {
-    SYSLOG("ibt", "start");
-    lilu.onKextLoadForce(&kextIOUSBHost, 1,
-        [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-            processUSBHost(patcher, index, address, size);
+    const bool disableIntelPatch = checkKernelArgument("-ibtupatchoff");
+    const bool disableBlueTool = checkKernelArgument("-ibtubluetooloff");
+    SYSLOG("ibt", "start (IntelBTPatcher=%d BlueToolFixup=%d)", !disableIntelPatch, !disableBlueTool);
+    if (!disableIntelPatch) {
+        lilu.onKextLoadForce(&kextIOUSBHost, 1,
+            [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+                processUSBHost(patcher, index, address, size);
+            });
+    }
+    if (!disableBlueTool) {
+        lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+            processPatcher(patcher);
         });
-    lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
-        processPatcher(patcher);
-    });
+    }
 }
+
+
 
 // Argumentos de arranque. Se aceptan tambien los de los kexts originales.
 static const char *bootargOff[] { "-ibtoff", "-ibtcompatoff", "-btlfxoff" };
