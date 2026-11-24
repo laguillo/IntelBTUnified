@@ -54,12 +54,19 @@ Un ID que no esté en la tabla se rechaza en vez de tratarse como Gen2 en silenc
 El `BTLEAdvFixup.kext` de [ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm) engancha la misma función que la parte
 IntelBTPatcher (`IOUSBHostDevice::deviceRequest`), y Lilu entra en pánico si dos plugins enganchan la misma función. Para usar los dos:
 
-- Añade `-ibtupatchoff`: `BTLEAdvFixup` se encarga de lo que hacía esa parte.
+- Añade `-ibtupatchoff`: `BTLEAdvFixup` se encarga de lo que hacía esa parte. Añade también los flags del propio ForbiddenItlwm
+  (`-btleadv`, `-itlawdl…`, ver su [BOOT-FLAGS](https://github.com/retropineaple/ForbiddenItlwm/blob/main/docs/BOOT-FLAGS.md)).
 - En `Kernel → Add`, pon `IntelBTUnified.kext` antes de `BTLEAdvFixup.kext`. `BTLEAdvFixup` tiene que cargarse después de los
   parches de BlueToolFixup, que aplica este kext.
+- Tras reiniciar, `ioreg -l -w0 -d1 | grep '"BTLEAdvHookRouted'` tiene que dar `1`.
+- Antes de actualizar macOS, arranca una vez sin `-btleadv`. Si aun así la actualización falla, desactiva también `BTLEAdvFixup` y
+  añade `-ibtubluetooloff` durante la actualización (la guía de ForbiddenItlwm pide lo mismo con `BlueToolFixup`).
 
-Esta combinación no se ha probado aquí. Cada kext esquiva a su manera el bucle de crashes de APFS que se describe más abajo
-(este desaloja páginas antes del pagein, `BTLEAdvFixup` engancha `apfs_vnop_verify`). La guía de ForbiddenItlwm solo da soporte a
+Probado con un Intel AX210, macOS 26.7.3 (Tahoe), ForbiddenItlwm 0.6.0-beta.4 y BTLEAdvFixup 0.9.4: arranca sin panic, los hooks
+de `BTLEAdvFixup` están activos, `awdl0` está levantada y el Bluetooth encendido. Otro usuario informa de que le funciona con un AX210
+([#2](https://github.com/laguillo/IntelBTUnified/pull/2#issuecomment-7117792255)). La estabilidad a largo plazo aún no está
+confirmada: cada kext esquiva a su manera el bucle de crashes de APFS que se describe más abajo (este desaloja páginas antes del
+pagein, `BTLEAdvFixup` engancha `apfs_vnop_verify`), y los dos están activos a la vez. La guía de ForbiddenItlwm solo da soporte a
 `IntelBluetoothFirmware` + `BlueToolFixup` + `BTLEAdvFixup`.
 
 ### Ver los logs del kernel

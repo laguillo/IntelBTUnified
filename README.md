@@ -54,12 +54,19 @@ An ID that is not in the table is rejected instead of being silently treated as 
 [ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm)'s `BTLEAdvFixup.kext` hooks the same function as the IntelBTPatcher
 part (`IOUSBHostDevice::deviceRequest`), and Lilu panics if two plugins hook the same function. To use both:
 
-- Add `-ibtupatchoff`: `BTLEAdvFixup` takes over that part's job.
+- Add `-ibtupatchoff`: `BTLEAdvFixup` takes over that part's job. Add ForbiddenItlwm's own flags too (`-btleadv`, `-itlawdl…`,
+  see its [BOOT-FLAGS](https://github.com/retropineaple/ForbiddenItlwm/blob/main/docs/BOOT-FLAGS.md)).
 - In `Kernel → Add`, put `IntelBTUnified.kext` before `BTLEAdvFixup.kext`. `BTLEAdvFixup` must load after the BlueToolFixup patches,
   which this kext applies.
+- After rebooting, `ioreg -l -w0 -d1 | grep '"BTLEAdvHookRouted'` must show `1`.
+- Before updating macOS, boot once without `-btleadv`. If the update still fails, also disable `BTLEAdvFixup` and add
+  `-ibtubluetooloff` for the update (ForbiddenItlwm's guide asks the same of `BlueToolFixup`).
 
-This combination has not been tested here. Each kext then works around the APFS crash loop described below in its own way
-(this one evicts pages before a pagein, `BTLEAdvFixup` hooks `apfs_vnop_verify`). ForbiddenItlwm's own guide supports only
+Tested on an Intel AX210 with macOS 26.7.3 (Tahoe), ForbiddenItlwm 0.6.0-beta.4 and BTLEAdvFixup 0.9.4: it boots without a panic,
+`BTLEAdvFixup`'s hooks are active, `awdl0` is up and Bluetooth is on. Another user reports it working on an AX210
+([#2](https://github.com/laguillo/IntelBTUnified/pull/2#issuecomment-7117792255)). Long-term stability is not confirmed yet: each kext
+works around the APFS crash loop described below in its own way (this one evicts pages before a pagein, `BTLEAdvFixup` hooks
+`apfs_vnop_verify`), and both are active at once. ForbiddenItlwm's own guide supports only
 `IntelBluetoothFirmware` + `BlueToolFixup` + `BTLEAdvFixup`.
 
 ### Reading the kernel logs
